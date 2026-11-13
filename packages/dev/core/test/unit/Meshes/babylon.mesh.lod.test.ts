@@ -1,5 +1,6 @@
 import { ArcRotateCamera } from "core/Cameras/arcRotateCamera";
 import { Camera } from "core/Cameras/camera";
+import { FreeCamera } from "core/Cameras/freeCamera";
 import { BoundingSphere } from "core/Culling/boundingSphere";
 import { type Engine } from "core/Engines/engine";
 import { Constants } from "core/Engines/constants";
@@ -366,6 +367,131 @@ describe("Babylon Mesh Levels of Details", () => {
             knot0.addLODLevel(30, knot1);
 
             expect(knot0.getLODLevels().length).toEqual(1);
+        });
+    });
+
+    describe("LOD switching hysteresis", () => {
+        let knotFine: Mesh;
+        let knotCoarse: Mesh;
+
+        beforeEach(() => {
+            // The detailed level is the mesh itself, the coarse one is registered at 15 and the culling level at 30.
+            knotFine = knot0;
+            knotCoarse = knot1;
+            knotFine.addLODLevel(15, knotCoarse);
+            knotFine.addLODLevel(30, null);
+        });
+
+        const walk = (camera: FreeCamera, distances: number[]): (string | null)[] => {
+            return distances.map((distance) => {
+                camera.position.set(0, 0, -distance);
+                scene.render();
+                return knotFine.getLOD(camera)?.name ?? null;
+            });
+        };
+
+        it("should keep the previous level when the camera only wobbles around a threshold", () => {
+            const camera = new FreeCamera("Camera", Vector3.Zero(), scene);
+            knotFine.computeWorldMatrix(true);
+            scene.render();
+
+            // First crossing to the coarse level is immediate, then 15.9 / 16 / 15.9 never switch back.
+            expect(walk(camera, [16])).toEqual(["Knot1"]);
+            expect(walk(camera, [15.9, 16, 15.9, 16])).toEqual(["Knot1", "Knot1", "Knot1", "Knot1"]);
+
+            // Going back in far enough (below 15 * 0.9 = 13.5) restores the fine level immediately.
+            expect(walk(camera, [13.5, 13.4])).toEqual(["Knot1", "Knot0"]);
+            expect(walk(camera, [14])).toEqual(["Knot0"]);
+        });
+
+        it("should keep the previous level after moving back across a threshold", () => {
+            const camera = new FreeCamera("Camera", Vector3.Zero(), scene);
+            knotFine.computeWorldMatrix(true);
+            scene.render();
+
+            const expected = ["Knot0", "Knot0", "Knot1", "Knot1", "Knot1", "Knot0", "Knot1", null, null, "Knot1"];
+            const selected = walk(camera, [10, 14, 16, 14, 16, 10, 29, 31, 29, 20]);
+
+            expect(selected).toEqual(expected);
+        });
+
+        it("should keep the hysteresis on the culling level", () => {
+            const camera = new FreeCamera("Camera", Vector3.Zero(), scene);
+            knotFine.computeWorldMatrix(true);
+            scene.render();
+
+            // 31 switches to the null level, 29 keeps it, 20 goes back to the coarse (hysteresis) level.
+            expect(walk(camera, [20, 31, 29])).toEqual(["Knot1", null, null]);
+            expect(walk(camera, [20])).toEqual(["Knot1"]);
+        });
+
+        it("should use the world distance including parent scaling", () => {
+            const camera = new FreeCamera("Camera", Vector3.Zero(), scene);
+
+            const parent = MeshBuilder.CreateBox("parent", { size: 1 }, scene);
+            parent.scaling.x = 2;
+            knotFine.parent = parent;
+            knotFine.position.x = 10;
+            knotFine.computeWorldMatrix(true);
+            scene.render();
+
+            // The mesh center is 20 units away from the camera: the coarse level is already in use.
+            expect(knotFine.getLOD(camera)!.name).toEqual("Knot1");
+            expect(knotFine.getLOD(camera)!).toBe(knotCoarse);
+        });
+
+        it("should not modify the LOD meshes geometry when switching", () => {
+            const camera = new FreeCamera("Camera", Vector3.Zero(), scene);
+            knotFine.computeWorldMatrix(true);
+
+            const finePositions = new Float32Array(knotFine.getVerticesData("position")!);
+            const coarsePositions = new Float32Array(knotCoarse.getVerticesData("position")!);
+
+            walk(camera, [10, 31, 10, 31]);
+
+            expect(new Float32Array(knotFine.getVerticesData("position")!)).toEqual(finePositions);
+            expect(new Float32Array(knotCoarse.getVerticesData("position")!)).toEqual(coarsePositions);
+        });
+
+        it("should apply the hysteresis to screen coverage too", () => {
+            knotFine.useLODScreenCoverage = true;
+            knotFine.removeLODLevel(knotCoarse);
+            knotFine.removeLODLevel(null);
+            knotFine.addLODLevel(0.5, knotCoarse);
+
+            const camera = new ArcRotateCamera("Camera", 0, 0, 10, new Vector3(0, 0, 0), scene);
+            knotFine.computeWorldMatrix(true);
+            scene.render();
+
+            const coverageCamera = (radius: number): string | null => {
+                camera.radius = radius;
+                scene.render();
+                return knotFine.getLOD(camera)?.name ?? null;
+            };
+
+            // Moving further away reduces the coverage and crosses the 0.5 threshold: the coarse level is entered
+            // immediately. Moving back to a coverage just above the threshold (0.5 to 0.55) keeps it, while a
+            // larger move back clears the 10% band and restores the fine level.
+            expect(coverageCamera(20)).toEqual("Knot0");
+            expect(coverageCamera(80)).toEqual("Knot1");
+            expect(coverageCamera(72)).toEqual("Knot1");
+            expect(coverageCamera(69)).toEqual("Knot0");
+        });
+
+        it("should expose the current level index and allow the hysteresis to be disabled", () => {
+            const camera = new FreeCamera("Camera", Vector3.Zero(), scene);
+            knotFine.computeWorldMatrix(true);
+            scene.render();
+
+            // Levels are [30 (null), 15 (coarse)]: the mesh itself (fine) is index 2.
+            expect(knotFine.getCurrentLODLevelIndex(camera)).toEqual(2);
+
+            walk(camera, [16]);
+            expect(knotFine.getCurrentLODLevelIndex(camera)).toEqual(1);
+
+            knotFine.lodHysteresis = 0;
+            expect(walk(camera, [14])).toEqual(["Knot0"]);
+            expect(knotFine.getCurrentLODLevelIndex(camera)).toEqual(2);
         });
     });
 });

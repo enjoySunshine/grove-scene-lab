@@ -210,6 +210,10 @@ class _InternalMeshDataInfo {
     public _LODLevels = new Array<MeshLODLevel>();
     /** Alternative definition of LOD level, using screen coverage instead of distance */
     public _useLODScreenCoverage: boolean = false;
+    /** Hysteresis band applied to the LOD thresholds, as a fraction of each threshold. `null` means "use the default". */
+    public _lodHysteresis: Nullable<number> = null;
+    /** Level currently in use for each camera and bounding sphere. `levels.length` means the mesh itself is rendered. */
+    public _lodSelectionStates: WeakMap<Camera, WeakMap<BoundingSphere, number>> = new WeakMap();
     public _checkReadinessObserver: Nullable<Observer<Scene>>;
 
     public _onMeshReadyObserverAdded: (observer: Observer<Mesh>) => void;
@@ -354,6 +358,12 @@ export class Mesh extends AbstractMesh implements IGetSetVerticesData {
     public static INSTANCEDMESH_SORT_TRANSPARENT = false;
 
     /**
+     * Default hysteresis band applied to LOD switching thresholds, as a fraction of each threshold.
+     * See {@link Mesh.lodHysteresis}.
+     */
+    public static DefaultLODHysteresis = 0.1;
+
+    /**
      * Gets the default side orientation.
      * @param orientation the orientation to value to attempt to get
      * @returns the default orientation
@@ -375,7 +385,24 @@ export class Mesh extends AbstractMesh implements IGetSetVerticesData {
 
     public set useLODScreenCoverage(value: boolean) {
         this._internalMeshDataInfo._useLODScreenCoverage = value;
+        this._internalMeshDataInfo._lodSelectionStates = new WeakMap();
         this._sortLODLevels();
+    }
+
+    /**
+     * Gets or sets the hysteresis band applied to the LOD switching thresholds, as a fraction of each threshold.
+     * When the camera moves back across a threshold, the level currently in use is kept until the distance (or
+     * screen coverage) has moved this fraction beyond it. This prevents the LOD level from flickering when the
+     * camera stays close to a threshold. `0` restores the immediate switching behavior.
+     * Defaults to {@link Mesh.DefaultLODHysteresis}.
+     */
+    public get lodHysteresis(): number {
+        return this._internalMeshDataInfo._lodHysteresis ?? Mesh.DefaultLODHysteresis;
+    }
+
+    public set lodHysteresis(value: number) {
+        this._internalMeshDataInfo._lodHysteresis = value > 0 ? Math.min(value, 1) : 0;
+        this._internalMeshDataInfo._lodSelectionStates = new WeakMap();
     }
 
     /**
@@ -1170,6 +1197,8 @@ export class Mesh extends AbstractMesh implements IGetSetVerticesData {
 
         const level = new MeshLODLevel(distanceOrScreenCoverage, mesh);
         this._internalMeshDataInfo._LODLevels.push(level);
+        // The threshold layout changed, so the previously selected level can no longer be trusted.
+        this._internalMeshDataInfo._lodSelectionStates = new WeakMap();
 
         if (mesh) {
             mesh._masterMesh = this;
@@ -1216,7 +1245,27 @@ export class Mesh extends AbstractMesh implements IGetSetVerticesData {
         }
 
         this._sortLODLevels();
+        // The threshold layout changed, so the previously selected level can no longer be trusted.
+        this._internalMeshDataInfo._lodSelectionStates = new WeakMap();
         return this;
+    }
+
+    /**
+     * Returns the index of the LOD level currently in use for the passed camera and bounding sphere. Levels are
+     * indexed from the coarsest to the finest, and the returned value is `getLODLevels().length` when the mesh
+     * itself is rendered. This reflects the hysteresis: it is the level the selection will keep until the value
+     * moves out of the hysteresis band.
+     * @param camera defines the camera to use
+     * @param boundingSphere defines an optional bounding sphere. Defaults to the one of this mesh.
+     * @returns the index of the current LOD level
+     */
+    public getCurrentLODLevelIndex(camera: Camera, boundingSphere?: BoundingSphere): number {
+        const states = this._internalMeshDataInfo._lodSelectionStates.get(camera);
+        const levelIndex = states?.get(boundingSphere || this.getBoundingInfo().boundingSphere);
+        if (levelIndex === undefined) {
+            return this._internalMeshDataInfo._LODLevels.length;
+        }
+        return levelIndex;
     }
 
     /**
@@ -1228,7 +1277,8 @@ export class Mesh extends AbstractMesh implements IGetSetVerticesData {
      */
     public override getLOD(camera: Camera, boundingSphere?: BoundingSphere): Nullable<AbstractMesh> {
         const internalDataInfo = this._internalMeshDataInfo;
-        if (!internalDataInfo._LODLevels || internalDataInfo._LODLevels.length === 0) {
+        const levels = internalDataInfo._LODLevels;
+        if (!levels || levels.length === 0) {
             return this;
         }
 
@@ -1246,37 +1296,77 @@ export class Mesh extends AbstractMesh implements IGetSetVerticesData {
             compareSign = -1;
         }
 
-        if (compareSign * internalDataInfo._LODLevels[internalDataInfo._LODLevels.length - 1].distanceOrScreenCoverage > compareSign * compareValue) {
-            if (this.onLODLevelSelection) {
-                this.onLODLevelSelection(compareValue, this, this);
+        // Resolve the level matching compareValue, ignoring hysteresis. Levels are sorted from the coarsest to
+        // the finest (see `_sortLODLevels`), and `levels.length` stands for the mesh itself, which is finer than
+        // every registered level. A level is selected as soon as its threshold is crossed.
+        const lastIndex = levels.length - 1;
+        let selectedLevelIndex = levels.length;
+        if (compareSign * levels[lastIndex].distanceOrScreenCoverage <= compareSign * compareValue) {
+            for (let index = 0; index < levels.length; index++) {
+                if (compareSign * levels[index].distanceOrScreenCoverage < compareSign * compareValue) {
+                    selectedLevelIndex = index;
+                    break;
+                }
             }
-            return this;
         }
 
-        for (let index = 0; index < internalDataInfo._LODLevels.length; index++) {
-            const level = internalDataInfo._LODLevels[index];
+        let states = internalDataInfo._lodSelectionStates.get(camera);
+        if (!states) {
+            states = new WeakMap<BoundingSphere, number>();
+            internalDataInfo._lodSelectionStates.set(camera, states);
+        }
+        const previousLevelIndex = states.get(bSphere);
 
-            if (compareSign * level.distanceOrScreenCoverage < compareSign * compareValue) {
-                if (level.mesh) {
-                    if (level.mesh.delayLoadState === Constants.DELAYLOADSTATE_NOTLOADED) {
-                        level.mesh._checkDelayState();
-                        return this;
-                    }
-
-                    if (level.mesh.delayLoadState === Constants.DELAYLOADSTATE_LOADING) {
-                        return this;
-                    }
-
-                    level.mesh._preActivate();
-                    level.mesh._updateSubMeshesBoundingInfo(this.worldMatrixFromCache);
+        // Levels are indexed from the coarsest to the finest, with `levels.length` standing for the mesh itself.
+        // Entering a coarser level is immediate. Returning to a finer level only happens once the value has moved
+        // a hysteresis band past the threshold currently in force. This prevents the level from flickering when
+        // the camera hovers around a threshold, and it applies to the "not drawn" level too, so a mesh that just
+        // left view does not pop back in on a small camera move.
+        if (previousLevelIndex !== undefined && previousLevelIndex < levels.length && selectedLevelIndex > previousLevelIndex) {
+            const hysteresis = this._getLODLevelHysteresis();
+            if (hysteresis > 0) {
+                // `threshold` is the threshold of the level being left, normalized so that a larger value always
+                // means "coarser" in both distance and screen coverage modes. Returning to a finer level means
+                // going below that threshold; the switch is delayed until the band is cleared.
+                const threshold = compareSign * levels[previousLevelIndex].distanceOrScreenCoverage;
+                if (compareSign * compareValue >= threshold - Math.abs(threshold) * hysteresis) {
+                    return this._getLODLevelMesh(previousLevelIndex, levels, compareValue);
                 }
-
-                if (this.onLODLevelSelection) {
-                    this.onLODLevelSelection(compareValue, this, level.mesh);
-                }
-
-                return level.mesh;
             }
+        }
+
+        states.set(bSphere, selectedLevelIndex);
+        return this._getLODLevelMesh(selectedLevelIndex, levels, compareValue);
+    }
+
+    private _getLODLevelHysteresis(): number {
+        const value = this._internalMeshDataInfo._lodHysteresis ?? Mesh.DefaultLODHysteresis;
+        return value > 0 ? Math.min(value, 1) : 0;
+    }
+
+    private _getLODLevelMesh(levelIndex: number, levels: MeshLODLevel[], compareValue: number): Nullable<AbstractMesh> {
+        const level = levelIndex < levels.length ? levels[levelIndex] : null;
+
+        if (level) {
+            if (level.mesh) {
+                if (level.mesh.delayLoadState === Constants.DELAYLOADSTATE_NOTLOADED) {
+                    level.mesh._checkDelayState();
+                    return this;
+                }
+
+                if (level.mesh.delayLoadState === Constants.DELAYLOADSTATE_LOADING) {
+                    return this;
+                }
+
+                level.mesh._preActivate();
+                level.mesh._updateSubMeshesBoundingInfo(this.worldMatrixFromCache);
+            }
+
+            if (this.onLODLevelSelection) {
+                this.onLODLevelSelection(compareValue, this, level.mesh);
+            }
+
+            return level.mesh;
         }
 
         if (this.onLODLevelSelection) {
